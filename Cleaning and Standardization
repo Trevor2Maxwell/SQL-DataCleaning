@@ -1,0 +1,118 @@
+
+--  DATA CLEANING & STANDARDIZATION
+-- =================================
+
+-- This script uses window functions and case statements to find and fix inconsistencies.
+-- -----------------------------------------------------------------------------
+-- Query 1: Identify and flag potential duplicate clients.
+
+WITH DuplicateClients AS (
+    SELECT
+        ID,
+        FIRST_NAME,
+        LAST_NAME,
+        SIGNIFICANT_OTHER,
+        -- Assign a row number to each record within a group of duplicates
+        ROW_NUMBER() OVER(
+            PARTITION BY FIRST_NAME, LAST_NAME, SIGNIFICANT_OTHER
+            ORDER BY CREATED_AT -- We order by creation date to find the 'first' record
+        ) AS RowNum
+    FROM CLIENTS
+    WHERE API_REMOVED_DATE IS NULL -- Only consider active records
+)
+SELECT
+    ID,
+    FIRST_NAME,
+    LAST_NAME,
+    SIGNIFICANT_OTHER,
+    'Potential Duplicate' AS IssueType
+FROM DuplicateClients
+WHERE RowNum > 1;
+
+-- -----------------------------------------------------------------------------
+-- Query 2: Standardize patient species names.
+
+SELECT
+    ID,
+    NAME,
+    SPECIES AS OriginalSpecies,
+    CASE
+        WHEN UPPER(SPECIES) IN ('CANINE', 'DOGS') THEN 'Dog'
+        WHEN UPPER(SPECIES) IN ('FELINE', 'CATS') THEN 'Cat'
+        WHEN UPPER(SPECIES) IN ('AVIAN') THEN 'Bird'
+        WHEN UPPER(SPECIES) IN ('REPTILE') THEN 'Reptile'
+        ELSE SPECIES -- Keep the original value if no match is found
+    END AS StandardizedSpecies
+FROM PATIENTS
+WHERE API_REMOVED_DATE IS NULL;
+
+-- -----------------------------------------------------------------------------
+-- Query 3: Find clients marked as 'DELETED' who still have active patients.
+-- This script checks for data integrity
+
+SELECT
+    c.ID AS ClientID,
+    c.FIRST_NAME,
+    c.LAST_NAME,
+    p.ID AS PatientID,
+    p.NAME AS PatientName
+FROM CLIENTS AS c
+JOIN PATIENTS AS p
+    ON c.ID = p.PRIMARY_CLIENT
+WHERE
+    c.API_REMOVED_DATE IS NOT NULL  -- Client is marked as removed/deleted
+    AND p.API_REMOVED_DATE IS NULL; -- Patient is still active
+
+
+-- These queries are perfect for dashboards
+-- -----------------------------------------------------------------------------
+-- Query 4: Calculate Customer Lifetime Value (CLV) with a running total.
+
+SELECT
+    t.ID,
+    t.CLIENT_ID,
+    c.FIRST_NAME,
+    c.LAST_NAME,
+    t.TRANSACTION_DATE,
+    t.TRANSACTION_TOTAL,
+    -- Calculate the running total of transaction revenue for each client
+    SUM(t.TRANSACTION_TOTAL) OVER (
+        PARTITION BY t.CLIENT_ID
+        ORDER BY t.TRANSACTION_DATE
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS RunningTotalSpend
+FROM TRANSACTIONS AS t
+JOIN CLIENTS AS c
+    ON t.CLIENT_ID = c.ID
+ORDER BY t.CLIENT_ID, t.TRANSACTION_DATE;
+
+-- -----------------------------------------------------------------------------
+-- Query 5: Rank patients by total spending within each client.
+
+WITH PatientSpending AS (
+    SELECT
+        PATIENT_ID,
+        CLIENT_ID,
+        SUM(TRANSACTION_TOTAL) AS TotalPatientSpend
+    FROM TRANSACTIONS
+    WHERE API_REMOVED_DATE IS NULL
+    GROUP BY PATIENT_ID, CLIENT_ID
+)
+SELECT
+    s.PATIENT_VID,
+    p.NAME AS PatientName,
+    s.CLIENT_ID,
+    c.FIRST_NAME AS ClientFirstName,
+    c.LAST_NAME AS ClientLastName,
+    s.TotalPatientSpend,
+    -- Rank patients by their spending within each client
+    DENSE_RANK() OVER (
+        PARTITION BY s.CLIENT_ID
+        ORDER BY s.TotalPatientSpend DESC
+    ) AS PatientRank
+FROM PatientSpending AS s
+JOIN PATIENTS AS p
+    ON s.PATIENTID = p.ID
+JOIN CLIENTS AS c
+    ON s.CLIENT_ID = c.ID
+ORDER BY s.CLIENTID, PatientRank;
